@@ -41,17 +41,25 @@ type Server struct {
 	cfg *config.Config
 	log *slog.Logger
 	hc  *http.Client
+	rl  *ipRateLimiter
 }
 
 func New(cfg *config.Config, log *slog.Logger) *Server {
-	return &Server{cfg: cfg, log: log, hc: &http.Client{Timeout: 10 * time.Second}}
+	return &Server{
+		cfg: cfg,
+		log: log,
+		hc:  &http.Client{Timeout: 10 * time.Second},
+		// Public, unauthenticated endpoints: bound per-client abuse. Generous
+		// for a human OAuth flow; a burst then ~30/min sustained.
+		rl: newIPRateLimiter(30, 8),
+	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /auth", s.auth)
-	mux.HandleFunc("GET /callback", s.callback)
+	mux.HandleFunc("GET /auth", s.rl.limit(s.auth))
+	mux.HandleFunc("GET /callback", s.rl.limit(s.callback))
 	mux.HandleFunc("GET /", s.index)
 	return mux
 }
