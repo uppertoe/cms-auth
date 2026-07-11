@@ -38,9 +38,10 @@ callback page uses a nonce CSP.
 | `GITHUB_CLIENT_SECRET` | ✅ | | OAuth App client secret |
 | `BASE_URL` | ✅ | | public origin of this relay, e.g. `https://cms-auth.example.org` |
 | `ALLOWED_ORIGINS` | ✅ | | comma-separated CMS origins allowed to receive a token |
-| `ALLOWED_SCOPES` | | `repo,public_repo` | scopes a caller may request |
+| `ALLOWED_SCOPES` | | `repo,public_repo,user` | scopes a caller may request (each token in a `repo,user` set is checked) |
 | `DEFAULT_SCOPE` | | `repo` | used when the caller requests none |
-| `STATE_SECRET` | | random | HMAC key for the state cookie; set to survive restarts / run replicas |
+| `STATE_SECRET` | | random | HMAC key for the state cookie; **set it** to survive restarts / run replicas (else in-flight logins drop on restart) |
+| `TRUST_FORWARDED` | | `true` | honour `X-Forwarded-For` for rate-limit identity. Safe only behind a proxy that **overwrites** XFF with the true peer. **Set `false` if you expose the relay directly** (no proxy) |
 | `LISTEN_ADDR` | | `:8080` | |
 
 The GitHub OAuth App's **Authorization callback URL** must be exactly

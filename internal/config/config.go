@@ -30,6 +30,16 @@ type Config struct {
 
 	StateSecret []byte // HMAC key for the signed state cookie (CSRF)
 
+	// TrustForwarded honours X-Forwarded-For for rate-limit client identity.
+	// Safe ONLY behind a proxy that overwrites XFF with the true peer (our Caddy
+	// cms-auth vhost does). Set false if the relay is exposed directly.
+	TrustForwarded bool
+
+	// StateSecretEphemeral is true when no STATE_SECRET was provided and a random
+	// per-process key was generated (fine for a single replica; a restart drops
+	// in-flight logins). main logs a warning so it's not silent.
+	StateSecretEphemeral bool
+
 	AuthURL  string // GitHub authorize endpoint (overridable for tests)
 	TokenURL string // GitHub token endpoint (overridable for tests)
 }
@@ -41,8 +51,9 @@ func Load() (*Config, error) {
 		ClientSecret:   os.Getenv("GITHUB_CLIENT_SECRET"),
 		BaseURL:        strings.TrimRight(os.Getenv("BASE_URL"), "/"),
 		AllowedOrigins: splitClean(os.Getenv("ALLOWED_ORIGINS")),
-		AllowedScopes:  splitClean(envOr("ALLOWED_SCOPES", "repo,public_repo")),
+		AllowedScopes:  splitClean(envOr("ALLOWED_SCOPES", "repo,public_repo,user")),
 		DefaultScope:   envOr("DEFAULT_SCOPE", "repo"),
+		TrustForwarded: envBool("TRUST_FORWARDED", true),
 		AuthURL:        envOr("GITHUB_AUTH_URL", "https://github.com/login/oauth/authorize"),
 		TokenURL:       envOr("GITHUB_TOKEN_URL", "https://github.com/login/oauth/access_token"),
 	}
@@ -77,6 +88,7 @@ func Load() (*Config, error) {
 		if _, err := rand.Read(c.StateSecret); err != nil {
 			return nil, fmt.Errorf("generate state secret: %w", err)
 		}
+		c.StateSecretEphemeral = true
 	}
 	return c, nil
 }
@@ -86,6 +98,16 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a boolean-ish env var (1/true/yes/on, case-insensitive);
+// anything else present is false; absent returns def.
+func envBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return def
+	}
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
 func splitClean(s string) []string {

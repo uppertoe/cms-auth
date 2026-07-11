@@ -32,6 +32,9 @@ func main() {
 		slog.Error("configuration invalid", "err", err)
 		os.Exit(1)
 	}
+	if cfg.StateSecretEphemeral {
+		slog.Warn("STATE_SECRET not set — using a random per-process key; a restart drops in-flight logins (set STATE_SECRET for stability; required for more than one replica)")
+	}
 
 	srv := relay.New(cfg, slog.Default())
 	httpSrv := &http.Server{

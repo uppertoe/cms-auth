@@ -19,7 +19,7 @@ func newTestServer(t *testing.T, tokenURL string) *Server {
 		ClientSecret:   "secret",
 		BaseURL:        "https://cms-auth.example.org",
 		AllowedOrigins: []string{"https://handbook.example.org", "https://example.org"},
-		AllowedScopes:  []string{"repo", "public_repo"},
+		AllowedScopes:  []string{"repo", "public_repo", "user"},
 		DefaultScope:   "repo",
 		StateSecret:    []byte("test-key-test-key-test-key-32byte"),
 		AuthURL:        "https://github.com/login/oauth/authorize",
@@ -65,6 +65,31 @@ func TestAuthRejectsDisallowedScope(t *testing.T) {
 	s := newTestServer(t, "")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?scope=admin:org", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// Sveltia CMS requests the combined "repo,user" scope; every token is allowed,
+// so the whole set must pass and be forwarded verbatim to GitHub.
+func TestAuthAcceptsCombinedScope(t *testing.T) {
+	s := newTestServer(t, "")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?provider=github&scope=repo,user", nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if loc.Query().Get("scope") != "repo,user" {
+		t.Errorf("scope = %q, want repo,user", loc.Query().Get("scope"))
+	}
+}
+
+// A combined set is rejected if ANY token is disallowed.
+func TestAuthRejectsCombinedScopeWithDisallowedToken(t *testing.T) {
+	s := newTestServer(t, "")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?scope=repo,admin:org", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}

@@ -51,7 +51,7 @@ func New(cfg *config.Config, log *slog.Logger) *Server {
 		hc:  &http.Client{Timeout: 10 * time.Second},
 		// Public, unauthenticated endpoints: bound per-client abuse. Generous
 		// for a human OAuth flow; a burst then ~30/min sustained.
-		rl: newIPRateLimiter(30, 8),
+		rl: newIPRateLimiter(30, 8, cfg.TrustForwarded),
 	}
 }
 
@@ -86,13 +86,19 @@ func (s *Server) auth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported provider", http.StatusBadRequest)
 		return
 	}
+	// Clients may request a space- or comma-separated set of scopes (Sveltia CMS
+	// sends "repo,user"). Validate each requested scope against the allow-list
+	// individually rather than exact-matching the whole string.
 	scope := r.URL.Query().Get("scope")
-	switch {
-	case scope == "":
+	if scope == "" {
 		scope = s.cfg.DefaultScope
-	case !contains(s.cfg.AllowedScopes, scope):
-		http.Error(w, "scope not allowed", http.StatusBadRequest)
-		return
+	} else {
+		for _, tok := range strings.FieldsFunc(scope, func(r rune) bool { return r == ',' || r == ' ' }) {
+			if !contains(s.cfg.AllowedScopes, tok) {
+				http.Error(w, "scope not allowed", http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	state, err := randHex(24)

@@ -8,15 +8,21 @@ import (
 	"time"
 )
 
+// maxBuckets bounds the per-IP map so a flood of distinct keys (e.g. spoofed
+// X-Forwarded-For when TrustForwarded is on but no overwriting proxy sits in
+// front) cannot grow memory without limit under the container's mem_limit.
+const maxBuckets = 50000
+
 // ipRateLimiter is a small per-client token-bucket limiter for the public,
 // unauthenticated endpoints. /callback triggers an outbound GitHub token
 // exchange on every hit, so this bounds how fast one client can drive that (and
 // blunts brute abuse of /auth). Stdlib-only, so the service stays dependency-free.
 type ipRateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*bucket
-	rate    float64 // tokens per second
-	burst   float64
+	mu       sync.Mutex
+	buckets  map[string]*bucket
+	rate     float64 // tokens per second
+	burst    float64
+	trustFwd bool // honour X-Forwarded-For (only safe behind an XFF-overwriting proxy)
 }
 
 type bucket struct {
@@ -24,11 +30,12 @@ type bucket struct {
 	last   time.Time
 }
 
-func newIPRateLimiter(perMinute, burst int) *ipRateLimiter {
+func newIPRateLimiter(perMinute, burst int, trustForwarded bool) *ipRateLimiter {
 	l := &ipRateLimiter{
-		buckets: make(map[string]*bucket),
-		rate:    float64(perMinute) / 60.0,
-		burst:   float64(burst),
+		buckets:  make(map[string]*bucket),
+		rate:     float64(perMinute) / 60.0,
+		burst:    float64(burst),
+		trustFwd: trustForwarded,
 	}
 	go l.cleanupLoop()
 	return l
@@ -42,6 +49,15 @@ func (l *ipRateLimiter) allow(ip string) bool {
 	now := time.Now()
 	b := l.buckets[ip]
 	if b == nil {
+		// Bound the map. Reclaim idle buckets first; if still at capacity, don't
+		// track this new key (memory stays bounded) — allow the request rather
+		// than deny legitimate traffic during a key-flood.
+		if len(l.buckets) >= maxBuckets {
+			l.sweepLocked(now.Add(-time.Minute))
+			if len(l.buckets) >= maxBuckets {
+				return true
+			}
+		}
 		b = &bucket{tokens: l.burst, last: now}
 		l.buckets[ip] = b
 	}
@@ -57,18 +73,22 @@ func (l *ipRateLimiter) allow(ip string) bool {
 	return true
 }
 
-// cleanupLoop evicts idle buckets so the map can't grow without bound.
+// sweepLocked evicts buckets idle since before cutoff. Caller holds l.mu.
+func (l *ipRateLimiter) sweepLocked(cutoff time.Time) {
+	for ip, b := range l.buckets {
+		if b.last.Before(cutoff) {
+			delete(l.buckets, ip)
+		}
+	}
+}
+
+// cleanupLoop periodically evicts idle buckets so the map can't grow without bound.
 func (l *ipRateLimiter) cleanupLoop() {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	for range t.C {
 		l.mu.Lock()
-		cutoff := time.Now().Add(-10 * time.Minute)
-		for ip, b := range l.buckets {
-			if b.last.Before(cutoff) {
-				delete(l.buckets, ip)
-			}
-		}
+		l.sweepLocked(time.Now().Add(-10 * time.Minute))
 		l.mu.Unlock()
 	}
 }
@@ -76,7 +96,7 @@ func (l *ipRateLimiter) cleanupLoop() {
 // limit wraps a handler, rejecting an over-rate client with 429.
 func (l *ipRateLimiter) limit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !l.allow(clientIP(r)) {
+		if !l.allow(clientIP(r, l.trustFwd)) {
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
@@ -85,16 +105,21 @@ func (l *ipRateLimiter) limit(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// clientIP reads the true client from X-Forwarded-For — Caddy overwrites it with
-// the real peer for this vhost (see cms-auth.caddy), so it can't be spoofed —
-// falling back to the connection's remote address.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			xff = xff[:i]
-		}
-		if ip := strings.TrimSpace(xff); ip != "" {
-			return ip
+// clientIP identifies the caller. When trustForwarded is set (deployed behind a
+// proxy that OVERWRITES X-Forwarded-For with the true peer, e.g. our Caddy
+// cms-auth vhost), it reads the leftmost XFF; otherwise, and always as a
+// fallback, it uses the connection's remote address. Trusting XFF without such
+// a proxy lets a client forge its identity — hence the flag defaults on only
+// because the shipped deployment guarantees the overwrite.
+func clientIP(r *http.Request, trustForwarded bool) string {
+	if trustForwarded {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				xff = xff[:i]
+			}
+			if ip := strings.TrimSpace(xff); ip != "" {
+				return ip
+			}
 		}
 	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {

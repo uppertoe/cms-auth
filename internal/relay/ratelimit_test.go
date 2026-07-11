@@ -8,7 +8,7 @@ import (
 
 // A burst is allowed, then the client is throttled with 429.
 func TestRateLimitBurstThenThrottle(t *testing.T) {
-	l := newIPRateLimiter(30, 5) // burst 5
+	l := newIPRateLimiter(30, 5, true) // burst 5
 	for i := 0; i < 5; i++ {
 		if !l.allow("1.2.3.4") {
 			t.Fatalf("request %d within burst should be allowed", i+1)
@@ -27,7 +27,7 @@ func TestRateLimitBurstThenThrottle(t *testing.T) {
 // bucket empties.
 func TestAuthRateLimited(t *testing.T) {
 	s := newTestServer(t, "")
-	s.rl = newIPRateLimiter(30, 2) // tiny burst for the test
+	s.rl = newIPRateLimiter(30, 2, true) // tiny burst for the test
 	h := s.Handler()
 
 	code := func() int {
@@ -52,12 +52,16 @@ func TestClientIPPrefersForwardedFor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/auth", nil)
 	req.RemoteAddr = "10.0.0.1:5555"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
-	if got := clientIP(req); got != "203.0.113.7" {
-		t.Fatalf("clientIP = %q, want leftmost XFF 203.0.113.7", got)
+	if got := clientIP(req, true); got != "203.0.113.7" {
+		t.Fatalf("clientIP(trust) = %q, want leftmost XFF 203.0.113.7", got)
+	}
+	// With trust off, the forwarded header is ignored — use the peer.
+	if got := clientIP(req, false); got != "10.0.0.1" {
+		t.Fatalf("clientIP(no-trust) = %q, want peer 10.0.0.1", got)
 	}
 	req2 := httptest.NewRequest(http.MethodGet, "/auth", nil)
 	req2.RemoteAddr = "10.0.0.2:6666"
-	if got := clientIP(req2); got != "10.0.0.2" {
+	if got := clientIP(req2, true); got != "10.0.0.2" {
 		t.Fatalf("clientIP fallback = %q, want 10.0.0.2", got)
 	}
 }
