@@ -27,6 +27,21 @@ your editors don't (and won't) have GitHub accounts, that model doesn't work.
    each commit's **author** to the editor (committer stays the bot), and forwards
    to `api.github.com`.
 
+Decap's `github` backend is written for a per-user OAuth token, so the proxy also
+presents the small **identity/access surface** an App installation token can't
+produce natively (the same shape the `aws-cognito-github-proxy` backend relies on):
+
+| Call | What the proxy does | Why |
+| --- | --- | --- |
+| `GET /user` | **synthesized** from the Authelia editor (not proxied) | installation tokens have no user; keeps the CMS's displayed identity == the stamped commit author |
+| `GET /repos/{owner}/{repo}` | forwarded, then `permissions.push=true` **injected** | `hasWriteAccess()` reads `permissions.push`, absent from an installation-token response; the App holds `contents:write`, so it's true |
+| `POST .../git/commits`, `PUT/DELETE .../contents/*` | commit **author** set to the editor, committer to the bot | the "who edited" record, sourced from the Authelia login |
+
+Everything else is proxied unchanged. This surface is version-coupled to the
+`github` backend, so the CMS bundle is pinned and these three behaviours are
+covered by tests — a Decap upgrade that changes the contract fails there, not in
+an editor's browser.
+
 One broker + one GitHub App serves any number of CMS sites: each site points its
 config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 

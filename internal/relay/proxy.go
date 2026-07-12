@@ -43,6 +43,16 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Identity/access surface that a GitHub App installation token cannot produce
+	// but Decap's github backend probes at startup. We present the Authelia editor
+	// -- the SAME identity stampAuthorship writes as the commit author -- so what
+	// the CMS shows and what lands in git history never diverge. See the two
+	// helpers below (writeSyntheticUser / injectRepoPermissions) and README.
+	if r.Method == http.MethodGet && upstreamPath == "/user" {
+		s.writeSyntheticUser(w, origin, editor)
+		return
+	}
+
 	token, err := s.ghTokens.get(r.Context())
 	if err != nil {
 		s.log.Error("installation token mint failed", "err", err)
@@ -85,17 +95,85 @@ func (s *Server) proxyAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Decap's hasWriteAccess() reads permissions.push from GET /repos/{owner}/{repo},
+	// but an installation-token response omits the per-user permissions block. The
+	// App is scoped to contents:write on this repo, so push access is exactly true;
+	// inject it. Small body, safe to buffer -- everything else streams unbuffered.
+	outBody := io.Reader(resp.Body)
+	outLen := resp.ContentLength
+	if isRepoRootGet(r.Method, upstreamPath) && resp.StatusCode == http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxRewriteBody+1))
+		injected := injectRepoPermissions(raw)
+		outBody = bytes.NewReader(injected)
+		outLen = int64(len(injected))
+	}
+
 	for k, vs := range resp.Header {
-		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, "Access-Control-Allow-Origin") {
+		lk := strings.ToLower(k)
+		// content-length is re-derived below (it changes when we inject); drop the
+		// upstream one so a rewritten body can't be truncated to the old length.
+		if hopByHop[lk] || lk == "content-length" || strings.EqualFold(k, "Access-Control-Allow-Origin") {
 			continue
 		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
+	if outLen >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(outLen, 10))
+	}
 	s.setCORS(w, origin) // keep our CORS headers authoritative over any upstream echo
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, outBody)
+}
+
+// writeSyntheticUser answers GET /user. An App installation token has no "user"
+// (that endpoint needs a user-to-server token), but Decap's github backend needs
+// a user object for identity and display. We present the Authelia editor -- the
+// same identity stampAuthorship writes as the commit author -- so the CMS shows
+// who is editing and it never diverges from git history.
+func (s *Server) writeSyntheticUser(w http.ResponseWriter, origin string, e Editor) {
+	u := map[string]any{
+		"login":      e.Email, // display handle only; the commit author is stamped separately
+		"name":       e.Name,
+		"email":      e.Email,
+		"avatar_url": "",
+		"type":       "User",
+	}
+	b, _ := json.Marshal(u)
+	s.setCORS(w, origin)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+// injectRepoPermissions adds a user-style permissions block to a repo object.
+// Malformed bodies pass through unchanged (GitHub errors are surfaced as-is).
+func injectRepoPermissions(raw []byte) []byte {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return raw
+	}
+	perms, _ := json.Marshal(map[string]bool{
+		"admin": true, "maintain": true, "push": true, "triage": true, "pull": true,
+	})
+	obj["permissions"] = perms
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// isRepoRootGet matches GET /repos/{owner}/{repo} exactly (the repo object), not
+// its sub-resources (contents, git, branches, ...).
+func isRepoRootGet(method, p string) bool {
+	if method != http.MethodGet || !strings.HasPrefix(p, "/repos/") {
+		return false
+	}
+	rest := strings.Trim(strings.TrimPrefix(p, "/repos/"), "/")
+	return strings.Count(rest, "/") == 1
 }
 
 // editorFromRequest validates the session token the CMS sends as
@@ -216,8 +294,10 @@ var hopByHop = map[string]bool{
 func copyProxyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		lk := strings.ToLower(k)
+		// Drop accept-encoding so Go's transport adds its own and transparently
+		// decompresses the response -- injectRepoPermissions must see plain JSON.
 		if hopByHop[lk] || lk == "host" || lk == "cookie" || lk == "content-length" ||
-			lk == "origin" || strings.HasPrefix(lk, "x-forwarded-") {
+			lk == "origin" || lk == "accept-encoding" || strings.HasPrefix(lk, "x-forwarded-") {
 			continue
 		}
 		for _, v := range vs {

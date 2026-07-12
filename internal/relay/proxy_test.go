@@ -59,6 +59,14 @@ func stubGitHub(t *testing.T, gotCommit *capturedCommit, mintCount *int) *httpte
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"login": "bot"})
 	})
+	mux.HandleFunc("/repos/anaes-data-lab/rch-handbooks-hugo", func(w http.ResponseWriter, r *http.Request) {
+		// An installation-token repo response OMITS the per-user permissions block.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"full_name":      "anaes-data-lab/rch-handbooks-hugo",
+			"owner":          map[string]string{"login": "anaes-data-lab"},
+			"default_branch": "main",
+		})
+	})
 	mux.HandleFunc("/repos/anaes-data-lab/rch-handbooks-hugo/git/commits", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer ghs_installation" {
 			t.Errorf("commit not carrying installation token")
@@ -128,12 +136,38 @@ func TestProxyRejectsDisallowedRepo(t *testing.T) {
 	}
 }
 
-func TestProxyPassesThroughUser(t *testing.T) {
+// /user is SYNTHESIZED from the Authelia editor (an installation token can't
+// answer /user), and it must match the identity we stamp as commit author.
+func TestProxyUserSynthesizedFromEditor(t *testing.T) {
 	gh := stubGitHub(t, nil, new(int))
 	defer gh.Close()
 	s := proxyServer(t, gh)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/user", nil)
+	req.Header.Set("Authorization", "token "+session(t, s, "jane@example.org", "Jane Doe"))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var u map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &u); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if u["email"] != "jane@example.org" || u["name"] != "Jane Doe" {
+		t.Errorf("synthetic user = %+v, want the editor identity", u)
+	}
+}
+
+// GET /repos/{owner}/{repo} must carry permissions.push=true so Decap's
+// hasWriteAccess() passes -- an installation-token response omits it.
+func TestProxyRepoRootInjectsPushPermission(t *testing.T) {
+	gh := stubGitHub(t, nil, new(int))
+	defer gh.Close()
+	s := proxyServer(t, gh)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/repos/anaes-data-lab/rch-handbooks-hugo", nil)
 	req.Header.Set("Authorization", "token "+session(t, s, "jane@example.org", "Jane"))
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -141,8 +175,20 @@ func TestProxyPassesThroughUser(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"login":"bot"`) {
-		t.Errorf("unexpected /user body: %s", rec.Body.String())
+	var repo struct {
+		Permissions map[string]bool `json:"permissions"`
+		Owner       struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &repo); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if !repo.Permissions["push"] {
+		t.Errorf("permissions.push not injected: %+v", repo.Permissions)
+	}
+	if repo.Owner.Login != "anaes-data-lab" {
+		t.Errorf("owner not preserved through injection: %q", repo.Owner.Login)
 	}
 }
 
@@ -184,7 +230,8 @@ func TestInstallationTokenCached(t *testing.T) {
 
 	tok := "token " + session(t, s, "jane@example.org", "Jane")
 	for i := 0; i < 3; i++ {
-		req := httptest.NewRequest(http.MethodGet, "/api/user", nil)
+		// a genuinely proxied endpoint (/user is synthesized, mints no token)
+		req := httptest.NewRequest(http.MethodGet, "/api/repos/anaes-data-lab/rch-handbooks-hugo", nil)
 		req.Header.Set("Authorization", tok)
 		s.Handler().ServeHTTP(httptest.NewRecorder(), req)
 	}
