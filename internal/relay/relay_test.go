@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"crypto/rsa"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -8,45 +10,74 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/uppertoe/sveltia-cms-auth/internal/config"
+	"github.com/uppertoe/cms-auth/internal/config"
 )
 
-func newTestServer(t *testing.T, tokenURL string) *Server {
+// one RSA key for the whole test binary (generation is the slow part).
+var testAppKey *rsa.PrivateKey
+
+func appKey(t *testing.T) *rsa.PrivateKey {
 	t.Helper()
-	cfg := &config.Config{
-		ClientID:       "cid",
-		ClientSecret:   "secret",
-		BaseURL:        "https://cms-auth.example.org",
-		AllowedOrigins: []string{"https://handbook.example.org", "https://example.org"},
-		AllowedScopes:  []string{"repo", "public_repo", "user"},
-		DefaultScope:   "repo",
-		StateSecret:    []byte("test-key-test-key-test-key-32byte"),
-		AuthURL:        "https://github.com/login/oauth/authorize",
-		TokenURL:       tokenURL,
+	if testAppKey == nil {
+		k, err := genTestKey()
+		if err != nil {
+			t.Fatalf("gen key: %v", err)
+		}
+		testAppKey = k
 	}
+	return testAppKey
+}
+
+func testConfig(t *testing.T) *config.Config {
+	t.Helper()
+	return &config.Config{
+		BaseURL:          "https://cms-auth.example.org",
+		AllowedOrigins:   []string{"https://handbook.example.org", "https://example.org"},
+		OIDCClientID:     "cms-auth",
+		OIDCClientSecret: "oidc-secret",
+		OIDCScopes:       "openid profile email groups",
+		// dummy overrides so authRedirectURL needs no network in redirect tests
+		OIDCAuthURL:     "https://sso.example.org/authorize",
+		OIDCTokenURL:    "https://sso.example.org/token",
+		OIDCUserInfoURL: "https://sso.example.org/userinfo",
+		AppID:           123,
+		InstallationID:  456,
+		AppKey:          appKey(t),
+		AllowedRepos:    []string{"anaes-data-lab/rch-handbooks-hugo"},
+		CommitterName:   "RCH Handbook Bot",
+		CommitterEmail:  "bot@example.org",
+		SessionSecret:   []byte("test-key-test-key-test-key-32byte"),
+		SessionTTL:      12 * time.Hour,
+		TrustForwarded:  true,
+		APIRoot:         "https://api.github.com",
+	}
+}
+
+func newServer(cfg *config.Config) *Server {
 	return New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// auth should set a signed state cookie and redirect to GitHub carrying the same
-// state, the configured redirect_uri, and the requested scope.
+// --- /auth ---
+
 func TestAuthRedirectsWithStateCookie(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?provider=github&scope=repo", nil))
 
 	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", rec.Code)
+		t.Fatalf("status = %d, want 302; body=%s", rec.Code, rec.Body.String())
 	}
 	loc, _ := url.Parse(rec.Header().Get("Location"))
-	if loc.Query().Get("client_id") != "cid" {
-		t.Errorf("client_id = %q", loc.Query().Get("client_id"))
+	if got := loc.Query().Get("client_id"); got != "cms-auth" {
+		t.Errorf("client_id = %q", got)
 	}
-	if loc.Query().Get("redirect_uri") != "https://cms-auth.example.org/callback" {
-		t.Errorf("redirect_uri = %q", loc.Query().Get("redirect_uri"))
+	if got := loc.Query().Get("redirect_uri"); got != "https://cms-auth.example.org/callback" {
+		t.Errorf("redirect_uri = %q", got)
 	}
-	if loc.Query().Get("scope") != "repo" {
-		t.Errorf("scope = %q", loc.Query().Get("scope"))
+	if got := loc.Query().Get("response_type"); got != "code" {
+		t.Errorf("response_type = %q", got)
 	}
 	state := loc.Query().Get("state")
 	if state == "" {
@@ -61,42 +92,8 @@ func TestAuthRedirectsWithStateCookie(t *testing.T) {
 	}
 }
 
-func TestAuthRejectsDisallowedScope(t *testing.T) {
-	s := newTestServer(t, "")
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?scope=admin:org", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
-// Sveltia CMS requests the combined "repo,user" scope; every token is allowed,
-// so the whole set must pass and be forwarded verbatim to GitHub.
-func TestAuthAcceptsCombinedScope(t *testing.T) {
-	s := newTestServer(t, "")
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?provider=github&scope=repo,user", nil))
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", rec.Code)
-	}
-	loc, _ := url.Parse(rec.Header().Get("Location"))
-	if loc.Query().Get("scope") != "repo,user" {
-		t.Errorf("scope = %q, want repo,user", loc.Query().Get("scope"))
-	}
-}
-
-// A combined set is rejected if ANY token is disallowed.
-func TestAuthRejectsCombinedScopeWithDisallowedToken(t *testing.T) {
-	s := newTestServer(t, "")
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?scope=repo,admin:org", nil))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-}
-
 func TestAuthRejectsWrongProvider(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth?provider=gitlab", nil))
 	if rec.Code != http.StatusBadRequest {
@@ -104,23 +101,50 @@ func TestAuthRejectsWrongProvider(t *testing.T) {
 	}
 }
 
-// callback: a valid state + a good token exchange yields an HTML page carrying
-// the success message and the origin allow-list, and NOT posting to '*'.
-func TestCallbackSuccess(t *testing.T) {
-	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// --- /callback ---
+
+// stubOIDC serves token + userinfo endpoints. groups controls the userinfo
+// response's group claim.
+func stubOIDC(t *testing.T, email, name string, groups []string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		if r.FormValue("client_secret") != "secret" || r.FormValue("code") != "thecode" {
-			t.Errorf("bad exchange form: %v", r.Form)
+		if r.FormValue("grant_type") != "authorization_code" || r.FormValue("client_secret") != "oidc-secret" {
+			t.Errorf("bad token request: %v", r.Form)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"gho_abc123","token_type":"bearer","scope":"repo"}`)
-	}))
-	defer gh.Close()
+		_, _ = io.WriteString(w, `{"access_token":"at_123","token_type":"bearer"}`)
+	})
+	mux.HandleFunc("/userinfo", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer at_123" {
+			t.Errorf("userinfo missing bearer: %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sub": "u-1", "email": email, "name": name, "groups": groups,
+		})
+	})
+	return httptest.NewServer(mux)
+}
 
-	s := newTestServer(t, gh.URL)
+func callbackConfig(t *testing.T, oidc *httptest.Server, editorGroup string) *config.Config {
+	cfg := testConfig(t)
+	cfg.OIDCTokenURL = oidc.URL + "/token"
+	cfg.OIDCUserInfoURL = oidc.URL + "/userinfo"
+	cfg.OIDCAuthURL = oidc.URL + "/authorize"
+	cfg.OIDCEditorGroup = editorGroup
+	return cfg
+}
+
+func TestCallbackSuccessMintsSession(t *testing.T) {
+	oidc := stubOIDC(t, "jane@example.org", "Jane Doe", []string{"cms-editors"})
+	defer oidc.Close()
+	s := newServer(callbackConfig(t, oidc, "cms-editors"))
+
 	state := "statevalue"
 	req := httptest.NewRequest(http.MethodGet, "/callback?code=thecode&state="+state, nil)
-	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.sign(state)})
+	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.signState(state)})
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 
@@ -128,29 +152,50 @@ func TestCallbackSuccess(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "authorization:github:success:") || !strings.Contains(body, "gho_abc123") {
-		t.Errorf("success message missing from body")
+	if !strings.Contains(body, "authorization:github:success:") {
+		t.Errorf("success handshake missing")
 	}
 	if !strings.Contains(body, "https://handbook.example.org") {
-		t.Errorf("allow-list origin missing from body")
+		t.Errorf("allow-list origin missing")
 	}
-	// The token must never be broadcast to '*'.
 	if strings.Contains(body, `postMessage(MSG, '*')`) || strings.Contains(body, `postMessage(MSG,"*")`) {
-		t.Errorf("token appears to be posted to '*'")
+		t.Errorf("token posted to '*'")
 	}
-	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "nonce-") {
-		t.Errorf("expected nonce CSP, got %q", csp)
+	// Extract the session token from the embedded message and verify it decodes
+	// to the editor identity.
+	tok := extractToken(t, body)
+	ed, err := s.parseSession(tok)
+	if err != nil {
+		t.Fatalf("session token invalid: %v", err)
 	}
-	// state cookie cleared
-	if ck := cookieByName(rec.Result().Cookies(), stateCookie); ck == nil || ck.MaxAge >= 0 {
-		t.Errorf("state cookie not cleared")
+	if ed.Email != "jane@example.org" || ed.Name != "Jane Doe" {
+		t.Errorf("editor = %+v", ed)
+	}
+}
+
+func TestCallbackDeniedByGroup(t *testing.T) {
+	oidc := stubOIDC(t, "eve@example.org", "Eve", []string{"other"})
+	defer oidc.Close()
+	s := newServer(callbackConfig(t, oidc, "cms-editors"))
+
+	state := "st"
+	req := httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.signState(state)})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (error handshake)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authorization:github:error:") {
+		t.Errorf("expected error handshake for non-editor")
 	}
 }
 
 func TestCallbackRejectsStateMismatch(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	req := httptest.NewRequest(http.MethodGet, "/callback?code=x&state=one", nil)
-	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.sign("two")}) // different state
+	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.signState("two")})
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -159,9 +204,9 @@ func TestCallbackRejectsStateMismatch(t *testing.T) {
 }
 
 func TestCallbackRejectsForgedCookie(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	req := httptest.NewRequest(http.MethodGet, "/callback?code=x&state=one", nil)
-	req.AddCookie(&http.Cookie{Name: stateCookie, Value: "one.deadbeef"}) // bad signature
+	req.AddCookie(&http.Cookie{Name: stateCookie, Value: "one.deadbeef"})
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -169,40 +214,18 @@ func TestCallbackRejectsForgedCookie(t *testing.T) {
 	}
 }
 
-// A failed exchange still renders a page (an error handshake), never a token.
-func TestCallbackExchangeError(t *testing.T) {
-	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"error":"bad_verification_code"}`)
-	}))
-	defer gh.Close()
-
-	s := newTestServer(t, gh.URL)
-	state := "st"
-	req := httptest.NewRequest(http.MethodGet, "/callback?code=bad&state="+state, nil)
-	req.AddCookie(&http.Cookie{Name: stateCookie, Value: s.sign(state)})
-	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (error handshake page)", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "authorization:github:error:") {
-		t.Errorf("expected error handshake in body")
-	}
-	if strings.Contains(rec.Body.String(), "access_token") {
-		t.Errorf("token leaked into error page")
-	}
-}
+// --- /healthz ---
 
 func TestHealthz(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Fatalf("healthz = %d %q", rec.Code, rec.Body.String())
 	}
 }
+
+// --- helpers ---
 
 func cookieByName(cks []*http.Cookie, name string) *http.Cookie {
 	for _, c := range cks {
@@ -211,4 +234,36 @@ func cookieByName(cks []*http.Cookie, name string) *http.Cookie {
 		}
 	}
 	return nil
+}
+
+// extractToken pulls the session token out of the JSON payload embedded in the
+// handshake page (var MSG = "...authorization:github:success:{...}").
+func extractToken(t *testing.T, body string) string {
+	t.Helper()
+	const marker = "authorization:github:success:"
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatal("no success marker in body")
+	}
+	// The payload JSON follows the marker up to the closing brace; the whole
+	// message is a JS string literal, so find the {...} object.
+	rest := body[i+len(marker):]
+	start := strings.IndexByte(rest, '{')
+	end := strings.IndexByte(rest, '}')
+	if start < 0 || end < 0 || end < start {
+		t.Fatal("no payload object in message")
+	}
+	// The embedded JSON escapes quotes for the JS string; unescape minimally.
+	raw := strings.ReplaceAll(rest[start:end+1], `\"`, `"`)
+	var payload struct {
+		Token    string `json:"token"`
+		Provider string `json:"provider"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("payload unmarshal: %v (%s)", err, raw)
+	}
+	if payload.Provider != "github" {
+		t.Errorf("provider = %q, want github", payload.Provider)
+	}
+	return payload.Token
 }

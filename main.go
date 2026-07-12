@@ -1,6 +1,7 @@
-// sveltia-cms-auth: a small, stateless GitHub OAuth relay for Sveltia CMS
-// (Decap/Netlify-compatible). One instance serves any number of CMS sites.
-// See README.md.
+// cms-auth: a small, stateless broker that lets a Git-based CMS (Decap and
+// other Netlify-CMS-protocol editors) commit through a shared GitHub App while
+// editors authenticate against an OIDC provider. One instance serves any number
+// of CMS sites. See README.md.
 package main
 
 import (
@@ -14,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/uppertoe/sveltia-cms-auth/internal/config"
-	"github.com/uppertoe/sveltia-cms-auth/internal/relay"
+	"github.com/uppertoe/cms-auth/internal/config"
+	"github.com/uppertoe/cms-auth/internal/relay"
 )
 
 func main() {
@@ -32,8 +33,8 @@ func main() {
 		slog.Error("configuration invalid", "err", err)
 		os.Exit(1)
 	}
-	if cfg.StateSecretEphemeral {
-		slog.Warn("STATE_SECRET not set — using a random per-process key; a restart drops in-flight logins (set STATE_SECRET for stability; required for more than one replica)")
+	if cfg.SessionSecretEphemeral {
+		slog.Warn("SESSION_SECRET not set — using a random per-process key; a restart drops in-flight logins and live CMS sessions (set SESSION_SECRET for stability; required for more than one replica)")
 	}
 
 	srv := relay.New(cfg, slog.Default())

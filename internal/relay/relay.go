@@ -1,23 +1,26 @@
-// Package relay implements a stateless GitHub OAuth relay for Sveltia CMS
-// (protocol-compatible with Decap / Netlify CMS external OAuth providers).
+// Package relay implements cms-auth: a stateless broker that lets a Git-based
+// CMS (Decap and other Netlify-CMS-protocol editors) commit through a shared
+// GitHub App while editors sign in with an OIDC provider (Authelia) — no
+// per-editor GitHub accounts required.
 //
 // Flow:
 //
-//	GET /auth      -> set a signed state cookie, 302 to GitHub's authorize page.
-//	GET /callback  -> verify state, exchange the code for a token server-side
-//	                  (using the client secret), then hand the token to the CMS
-//	                  popup's opener via postMessage.
+//	GET /auth      -> set a signed state cookie, 302 to the OIDC provider.
+//	GET /callback  -> verify state, exchange the code, read the editor's identity
+//	                  from userinfo, mint a signed SESSION token, and hand it to
+//	                  the CMS popup's opener via postMessage.
+//	/api/*         -> the CMS points its api_root here. Validate the session
+//	                  token, inject the shared App installation token (server-side
+//	                  only), stamp each commit's author with the editor, proxy to
+//	                  GitHub.
 //
-// One relay + one GitHub OAuth App serves any number of CMS instances: the
-// returned token is the editor's own, so it works on every repo they can reach.
-//
-// Hardening over the common reference providers: the token is only ever
-// postMessage'd to an origin on an explicit allow-list (the CMS admin pages),
-// so a page that merely opened the popup cannot receive it.
+// The GitHub credential is minted and held server-side and never reaches the
+// browser; the token the CMS holds is our session token, meaningful only to this
+// broker. The session token is only ever postMessage'd to an origin on an
+// explicit allow-list, so a page that merely opened the popup cannot receive it.
 package relay
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,29 +31,54 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
-	"github.com/uppertoe/sveltia-cms-auth/internal/config"
+	"github.com/uppertoe/cms-auth/internal/config"
 )
 
 const stateCookie = "cms_auth_state"
+const stateLabel = "cms-auth.state.v1"
 
 type Server struct {
-	cfg *config.Config
-	log *slog.Logger
-	hc  *http.Client
-	rl  *ipRateLimiter
+	cfg       *config.Config
+	log       *slog.Logger
+	oidc      *oidcClient
+	ghTokens  *installationTokenMinter
+	apiClient *http.Client
+	rl        *ipRateLimiter
 }
 
 func New(cfg *config.Config, log *slog.Logger) *Server {
+	hc := &http.Client{Timeout: 10 * time.Second}
 	return &Server{
 		cfg: cfg,
 		log: log,
-		hc:  &http.Client{Timeout: 10 * time.Second},
-		// Public, unauthenticated endpoints: bound per-client abuse. Generous
-		// for a human OAuth flow; a burst then ~30/min sustained.
+		oidc: &oidcClient{
+			issuer:       cfg.OIDCIssuer,
+			clientID:     cfg.OIDCClientID,
+			clientSecret: cfg.OIDCClientSecret,
+			redirectURI:  cfg.BaseURL + "/callback",
+			scopes:       cfg.OIDCScopes,
+			editorGroup:  cfg.OIDCEditorGroup,
+			hc:           hc,
+			override: oidcEndpoints{
+				Authorization: cfg.OIDCAuthURL,
+				Token:         cfg.OIDCTokenURL,
+				UserInfo:      cfg.OIDCUserInfoURL,
+			},
+		},
+		ghTokens: newInstallationTokenMinter(reqConfig{
+			AppID:          cfg.AppID,
+			InstallationID: cfg.InstallationID,
+			Key:            cfg.AppKey,
+			Repos:          cfg.AllowedRepos,
+			APIRoot:        cfg.APIRoot,
+		}, hc),
+		// Separate client for proxied API traffic: no timeout cap so large
+		// blob uploads aren't cut off mid-stream (GitHub bounds these itself).
+		apiClient: &http.Client{},
+		// Public, unauthenticated endpoints (/auth, /callback) are rate-limited;
+		// /api is authenticated by the session token and not limited here.
 		rl: newIPRateLimiter(30, 8, cfg.TrustForwarded),
 	}
 }
@@ -60,7 +88,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /auth", s.rl.limit(s.auth))
 	mux.HandleFunc("GET /callback", s.rl.limit(s.callback))
-	mux.HandleFunc("GET /", s.index)
+	mux.HandleFunc("/api/", s.proxyAPI)
+	mux.HandleFunc("/", s.index)
 	return mux
 }
 
@@ -76,58 +105,43 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 	baseHeaders(w)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.WriteString(w, "Sveltia CMS GitHub OAuth relay. Begin at /auth?provider=github.\n")
+	_, _ = io.WriteString(w, "cms-auth broker. Begin the CMS login at /auth.\n")
 }
 
-// auth starts the OAuth dance: stash a signed, single-use state in a cookie and
-// redirect the browser to GitHub.
+// auth starts the OIDC dance: stash a signed, single-use state in a cookie and
+// redirect the browser to the provider. The CMS opens this in a popup with
+// ?provider=github (its backend name); we accept that and ignore any scope.
 func (s *Server) auth(w http.ResponseWriter, r *http.Request) {
 	if p := r.URL.Query().Get("provider"); p != "" && p != "github" {
 		http.Error(w, "unsupported provider", http.StatusBadRequest)
 		return
 	}
-	// Clients may request a space- or comma-separated set of scopes (Sveltia CMS
-	// sends "repo,user"). Validate each requested scope against the allow-list
-	// individually rather than exact-matching the whole string.
-	scope := r.URL.Query().Get("scope")
-	if scope == "" {
-		scope = s.cfg.DefaultScope
-	} else {
-		for _, tok := range strings.FieldsFunc(scope, func(r rune) bool { return r == ',' || r == ' ' }) {
-			if !contains(s.cfg.AllowedScopes, tok) {
-				http.Error(w, "scope not allowed", http.StatusBadRequest)
-				return
-			}
-		}
-	}
-
 	state, err := randHex(24)
 	if err != nil {
 		s.log.Error("state generation failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	redirect, err := s.oidc.authRedirectURL(r.Context(), state)
+	if err != nil {
+		s.log.Error("oidc endpoint resolution failed", "err", err)
+		http.Error(w, "auth provider unavailable", http.StatusBadGateway)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     stateCookie,
-		Value:    s.sign(state),
+		Value:    s.signState(state),
 		Path:     "/",
 		MaxAge:   600,
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode, // sent on GitHub's top-level redirect back
+		SameSite: http.SameSiteLaxMode, // sent on the provider's top-level redirect back
 	})
-
-	q := url.Values{}
-	q.Set("client_id", s.cfg.ClientID)
-	q.Set("redirect_uri", s.cfg.BaseURL+"/callback")
-	q.Set("scope", scope)
-	q.Set("state", state)
-	q.Set("allow_signup", "false")
-	http.Redirect(w, r, s.cfg.AuthURL+"?"+q.Encode(), http.StatusFound)
+	http.Redirect(w, r, redirect, http.StatusFound)
 }
 
-// callback verifies the returned state, exchanges the code for a token using the
-// client secret, and renders the postMessage handshake page.
+// callback verifies the returned state, exchanges the code for the editor's
+// identity, mints a session token, and renders the postMessage handshake page.
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
@@ -144,60 +158,22 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.exchange(r.Context(), code)
+	editor, err := s.oidc.exchange(r.Context(), code)
 	if err != nil {
-		s.log.Error("token exchange failed", "err", err)
+		s.log.Warn("oidc exchange failed", "err", err)
 		s.renderResult(w, "", "authentication failed")
 		return
 	}
-	s.renderResult(w, token, "")
-}
-
-// exchange performs the server-side code->token POST. GitHub returns JSON when
-// asked with Accept: application/json.
-func (s *Server) exchange(ctx context.Context, code string) (string, error) {
-	form := url.Values{}
-	form.Set("client_id", s.cfg.ClientID)
-	form.Set("client_secret", s.cfg.ClientSecret)
-	form.Set("code", code)
-	form.Set("redirect_uri", s.cfg.BaseURL+"/callback")
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.TokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := s.hc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	if err != nil {
-		return "", err
-	}
-	var out struct {
-		AccessToken string `json:"access_token"`
-		Error       string `json:"error"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("unparsable token response")
-	}
-	if out.Error != "" {
-		return "", fmt.Errorf("github: %s", out.Error)
-	}
-	if out.AccessToken == "" {
-		return "", fmt.Errorf("empty access token")
-	}
-	return out.AccessToken, nil
+	editor.Exp = time.Now().Add(s.cfg.SessionTTL).Unix()
+	s.log.Info("cms session issued", "email", editor.Email, "name", editor.Name)
+	s.renderResult(w, s.mintSession(editor), "")
 }
 
 // renderResult writes the popup page that completes the Decap/Netlify handshake.
-// The page announces readiness ("authorizing:github") to the opener; when the
-// opener replies we verify its origin against the allow-list before handing the
-// token to that exact origin (never '*').
+// The provider stays "github" (the CMS backend name); the token it carries is
+// our session token, not a GitHub credential. The page announces readiness to
+// the opener; when the opener replies we verify its origin against the allow-list
+// before handing the token to that exact origin (never '*').
 func (s *Server) renderResult(w http.ResponseWriter, token, errMsg string) {
 	var message string
 	if errMsg != "" {
@@ -206,8 +182,6 @@ func (s *Server) renderResult(w http.ResponseWriter, token, errMsg string) {
 		payload, _ := json.Marshal(map[string]string{"token": token, "provider": "github"})
 		message = "authorization:github:success:" + string(payload)
 	}
-	// json.Marshal produces script-safe literals (escapes < > &), so these are
-	// safe to interpolate into the inline <script>.
 	msgJS, _ := json.Marshal(message)
 	allowedJS, _ := json.Marshal(s.cfg.AllowedOrigins)
 
@@ -250,27 +224,43 @@ const resultHTML = `<!doctype html>
 </script>
 </body></html>`
 
-// --- state cookie signing (CSRF) ---
+// --- state cookie signing (CSRF), domain-separated from the session token ---
 
-func (s *Server) sign(state string) string {
-	m := hmac.New(sha256.New, s.cfg.StateSecret)
-	m.Write([]byte(state))
-	return state + "." + hex.EncodeToString(m.Sum(nil))
+func (s *Server) signState(state string) string {
+	return state + "." + hex.EncodeToString(s.stateMAC(state))
 }
 
 func (s *Server) validState(cookieVal, queryState string) bool {
-	i := strings.LastIndexByte(cookieVal, '.')
+	i := lastDot(cookieVal)
 	if i < 0 {
 		return false
 	}
-	got, sig := cookieVal[:i], cookieVal[i+1:]
-	m := hmac.New(sha256.New, s.cfg.StateSecret)
-	m.Write([]byte(got))
-	want := hex.EncodeToString(m.Sum(nil))
-	if subtle.ConstantTimeCompare([]byte(sig), []byte(want)) != 1 {
+	got, sigHex := cookieVal[:i], cookieVal[i+1:]
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return false
+	}
+	if subtle.ConstantTimeCompare(sig, s.stateMAC(got)) != 1 {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(queryState)) == 1
+}
+
+func (s *Server) stateMAC(state string) []byte {
+	m := hmac.New(sha256.New, s.cfg.SessionSecret)
+	m.Write([]byte(stateLabel))
+	m.Write([]byte{0})
+	m.Write([]byte(state))
+	return m.Sum(nil)
+}
+
+func lastDot(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '.' {
+			return i
+		}
+	}
+	return -1
 }
 
 func baseHeaders(w http.ResponseWriter) {
@@ -286,13 +276,4 @@ func randHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }

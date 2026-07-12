@@ -26,7 +26,7 @@ func TestRateLimitBurstThenThrottle(t *testing.T) {
 // The limiter keys on the forwarded client IP, and /auth returns 429 once the
 // bucket empties.
 func TestAuthRateLimited(t *testing.T) {
-	s := newTestServer(t, "")
+	s := newServer(testConfig(t))
 	s.rl = newIPRateLimiter(30, 2, true) // tiny burst for the test
 	h := s.Handler()
 

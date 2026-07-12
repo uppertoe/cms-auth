@@ -14,9 +14,9 @@ import (
 const maxBuckets = 50000
 
 // ipRateLimiter is a small per-client token-bucket limiter for the public,
-// unauthenticated endpoints. /callback triggers an outbound GitHub token
-// exchange on every hit, so this bounds how fast one client can drive that (and
-// blunts brute abuse of /auth). Stdlib-only, so the service stays dependency-free.
+// unauthenticated endpoints. /callback triggers an outbound OIDC token exchange
+// on every hit, so this bounds how fast one client can drive that (and blunts
+// brute abuse of /auth). Stdlib-only, so the service stays dependency-free.
 type ipRateLimiter struct {
 	mu       sync.Mutex
 	buckets  map[string]*bucket

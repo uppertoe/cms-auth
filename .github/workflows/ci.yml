@@ -46,7 +46,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/sveltia-cms-auth
+          images: ghcr.io/${{ github.repository_owner }}/cms-auth
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
