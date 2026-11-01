@@ -38,6 +38,18 @@ type Config struct {
 	// (CORS). These are the CMS admin pages, e.g. https://handbook.example.org.
 	AllowedOrigins []string
 
+	// AuthMode picks how editors sign in: "oidc" (default) runs the OIDC leg
+	// against a provider; "gateway" trusts the identity headers of an
+	// authenticating reverse proxy on /auth (see gateway.go).
+	AuthMode string
+
+	// --- Gateway mode ---
+	// GatewaySecret is the value the proxy injects as X-Gateway-Secret; the
+	// identity headers are ignored without it. EditorGroup is the group the
+	// identity must carry (gateway mode requires it).
+	GatewaySecret string
+	EditorGroup   string
+
 	// --- OIDC (this broker is a confidential client of the provider) ---
 	OIDCIssuer       string // e.g. https://sso.example.org (discovery base)
 	OIDCClientID     string
@@ -83,6 +95,9 @@ func Load() (*Config, error) {
 		ListenAddr:       envOr("LISTEN_ADDR", ":8080"),
 		BaseURL:          strings.TrimRight(os.Getenv("BASE_URL"), "/"),
 		AllowedOrigins:   splitClean(os.Getenv("ALLOWED_ORIGINS")),
+		AuthMode:         envOr("AUTH_MODE", "oidc"),
+		GatewaySecret:    os.Getenv("GATEWAY_SECRET"),
+		EditorGroup:      os.Getenv("EDITOR_GROUP"),
 		OIDCIssuer:       strings.TrimRight(os.Getenv("OIDC_ISSUER"), "/"),
 		OIDCClientID:     os.Getenv("OIDC_CLIENT_ID"),
 		OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
@@ -105,9 +120,20 @@ func Load() (*Config, error) {
 		}
 	}
 	req("BASE_URL", c.BaseURL)
-	req("OIDC_ISSUER", c.OIDCIssuer)
-	req("OIDC_CLIENT_ID", c.OIDCClientID)
-	req("OIDC_CLIENT_SECRET", c.OIDCClientSecret)
+	switch c.AuthMode {
+	case "oidc":
+		req("OIDC_ISSUER", c.OIDCIssuer)
+		req("OIDC_CLIENT_ID", c.OIDCClientID)
+		req("OIDC_CLIENT_SECRET", c.OIDCClientSecret)
+	case "gateway":
+		req("GATEWAY_SECRET", c.GatewaySecret)
+		req("EDITOR_GROUP", c.EditorGroup)
+		if c.GatewaySecret != "" && len(c.GatewaySecret) < 32 {
+			return nil, fmt.Errorf("GATEWAY_SECRET must be at least 32 characters")
+		}
+	default:
+		return nil, fmt.Errorf("AUTH_MODE must be oidc or gateway, not %q", c.AuthMode)
+	}
 	req("COMMITTER_EMAIL", c.CommitterEmail)
 	if len(c.AllowedOrigins) == 0 {
 		missing = append(missing, "ALLOWED_ORIGINS")

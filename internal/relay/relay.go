@@ -1,7 +1,8 @@
 // Package relay implements cms-auth: a stateless broker that lets a Git-based
 // CMS (Decap and other Netlify-CMS-protocol editors) commit through a shared
-// GitHub App while editors sign in with an OIDC provider (Authelia) — no
-// per-editor GitHub accounts required.
+// GitHub App while editors sign in with an OIDC provider (Authelia) or through an
+// authenticating reverse proxy (gateway mode, gateway.go) — no per-editor
+// GitHub accounts required.
 //
 // Flow:
 //
@@ -86,8 +87,14 @@ func New(cfg *config.Config, log *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("GET /auth", s.rl.limit(s.auth))
-	mux.HandleFunc("GET /callback", s.rl.limit(s.callback))
+	if s.cfg.AuthMode == "gateway" {
+		// The proxy has already signed the editor in; /auth completes at once
+		// and there is no provider round trip, so no /callback.
+		mux.HandleFunc("GET /auth", s.rl.limit(s.gatewayAuth))
+	} else {
+		mux.HandleFunc("GET /auth", s.rl.limit(s.auth))
+		mux.HandleFunc("GET /callback", s.rl.limit(s.callback))
+	}
 	mux.HandleFunc("/api/", s.proxyAPI)
 	mux.HandleFunc("/", s.index)
 	return mux
