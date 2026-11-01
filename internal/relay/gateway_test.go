@@ -78,6 +78,9 @@ func TestGatewayAuthRefusals(t *testing.T) {
 			if !strings.Contains(body, "authorization:github:error:") || strings.Contains(body, "success") {
 				t.Errorf("want an error handshake; body=%s", body)
 			}
+			if !strings.Contains(body, `authorization:github:error:{\"message\":`) {
+				t.Errorf("error handshake is not JSON; body=%s", body)
+			}
 		})
 	}
 }
