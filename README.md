@@ -2,8 +2,8 @@
 
 A tiny, stateless **auth broker for a Git-based CMS** (Decap CMS and other
 Netlify-CMS-protocol editors). It lets editors who have **no GitHub account**
-sign in with your **OIDC provider** (Authelia) and commit through a **single
-shared GitHub App** — with each commit **authored as the signed-in editor**.
+sign in with your **OIDC provider** (Authelia), or through an **authenticating
+reverse proxy** (gateway mode), and commit through a **single shared GitHub App** — with each commit **authored as the signed-in editor**.
 
 The GitHub App credential is minted and held **server-side** and never reaches
 the browser.
@@ -50,7 +50,7 @@ config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 | Route | Purpose |
 | --- | --- |
 | `GET /auth` | set state cookie, 302 to the OIDC provider |
-| `GET /callback` | verify state, exchange code, read userinfo, mint session, postMessage handshake |
+| `GET /callback` | verify state, exchange code, read userinfo, mint session, postMessage handshake (OIDC mode only) |
 | `/api/*` | validate session, inject App token, stamp author, proxy to GitHub |
 | `GET /healthz` | liveness (`200 ok`) |
 
@@ -61,9 +61,12 @@ config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 | `BASE_URL` | ✅ | | public origin of this broker, e.g. `https://cms-auth.example.org`. Redirect URI is `${BASE_URL}/callback`. |
 | `ALLOWED_ORIGINS` | ✅ | | comma-separated CMS admin origins (postMessage target **and** CORS allow-list) |
 | `ALLOWED_REPOS` | ✅ | | comma-separated `owner/name` the proxy may touch; the installation token is scoped to exactly these |
-| `OIDC_ISSUER` | ✅ | | issuer base, e.g. `https://sso.example.org` (endpoints via discovery) |
-| `OIDC_CLIENT_ID` | ✅ | | OIDC client id registered with the provider |
-| `OIDC_CLIENT_SECRET` | ✅ | | OIDC client secret (confidential client) |
+| `AUTH_MODE` | | `oidc` | `oidc` runs the OIDC flow below; `gateway` trusts an authenticating reverse proxy (see "Gateway mode") |
+| `GATEWAY_SECRET` | gateway | | 32+ characters; the proxy injects it as `X-Gateway-Secret`, and the identity headers are ignored without it |
+| `EDITOR_GROUP` | gateway | | the group `Remote-Groups` must contain |
+| `OIDC_ISSUER` | oidc | | issuer base, e.g. `https://sso.example.org` (endpoints via discovery) |
+| `OIDC_CLIENT_ID` | oidc | | OIDC client id registered with the provider |
+| `OIDC_CLIENT_SECRET` | oidc | | OIDC client secret (confidential client) |
 | `OIDC_EDITOR_GROUP` | | | if set, the identity must carry this group claim, else login is refused |
 | `OIDC_SCOPES` | | `openid profile email groups` | requested scopes |
 | `GITHUB_APP_ID` | ✅ | | the shared GitHub App's id |
@@ -80,6 +83,23 @@ config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 
 Endpoint overrides `OIDC_AUTH_URL` / `OIDC_TOKEN_URL` / `OIDC_USERINFO_URL` skip
 discovery (used in tests / providers without a discovery document).
+
+### Gateway mode
+
+With `AUTH_MODE=gateway`, the broker runs behind an authenticating reverse
+proxy that signs the editor in before `/auth` is reached. `/auth` then reads
+`Remote-Email` and `Remote-Groups`, checks `EDITOR_GROUP`, and completes the
+postMessage handshake at once; there is no `/callback`. The commit author's
+name is built from the email address ("jane.citizen@…" becomes "Jane
+Citizen"). The proxy must:
+
+- gate `/auth` only, and leave `/api` to the session token (the CMS calls it
+  cross-origin without the proxy's cookie);
+- strip client-sent `Remote-*` headers and inject `X-Gateway-Secret`;
+- be the only route to the broker.
+
+Break-glass identities (`breakglass:…`) and anything that is not a plain
+email address are refused.
 
 ## Wiring a CMS site to it
 

@@ -56,3 +56,49 @@ func TestParseRSAKey_PKCS8(t *testing.T) {
 		t.Fatalf("PKCS#8 key rejected: %v", err)
 	}
 }
+
+func setGatewayEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("BASE_URL", "https://cms-auth.example.org")
+	t.Setenv("ALLOWED_ORIGINS", "https://handbook.example.org")
+	t.Setenv("ALLOWED_REPOS", "owner/repo")
+	t.Setenv("COMMITTER_EMAIL", "bot@example.org")
+	t.Setenv("GITHUB_APP_ID", "1")
+	t.Setenv("GITHUB_APP_INSTALLATION_ID", "2")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY_B64", base64.StdEncoding.EncodeToString(testKeyPEM(t)))
+	t.Setenv("AUTH_MODE", "gateway")
+	t.Setenv("GATEWAY_SECRET", "gateway-secret-gateway-secret-0123")
+	t.Setenv("EDITOR_GROUP", "cms-editors")
+}
+
+func TestLoad_GatewayModeNeedsNoOIDC(t *testing.T) {
+	setGatewayEnv(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AuthMode != "gateway" || c.EditorGroup != "cms-editors" {
+		t.Errorf("config = %+v", c)
+	}
+}
+
+func TestLoad_GatewayModeRejectsShortSecretOrNoGroup(t *testing.T) {
+	setGatewayEnv(t)
+	t.Setenv("GATEWAY_SECRET", "short")
+	if _, err := Load(); err == nil {
+		t.Error("expected error for a short GATEWAY_SECRET")
+	}
+	setGatewayEnv(t)
+	t.Setenv("EDITOR_GROUP", "")
+	if _, err := Load(); err == nil {
+		t.Error("expected error without EDITOR_GROUP")
+	}
+}
+
+func TestLoad_RejectsUnknownMode(t *testing.T) {
+	setGatewayEnv(t)
+	t.Setenv("AUTH_MODE", "saml")
+	if _, err := Load(); err == nil {
+		t.Error("expected error for an unknown AUTH_MODE")
+	}
+}
