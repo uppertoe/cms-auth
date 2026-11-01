@@ -184,7 +184,11 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renderResult(w http.ResponseWriter, token, errMsg string) {
 	var message string
 	if errMsg != "" {
-		message = "authorization:github:error:" + errMsg
+		// Decap JSON.parses the error part of the handshake, so it must be a
+		// JSON object; plain text surfaced to editors as "JSON.parse:
+		// unexpected character" instead of the reason.
+		payload, _ := json.Marshal(map[string]string{"message": errMsg})
+		message = "authorization:github:error:" + string(payload)
 	} else {
 		payload, _ := json.Marshal(map[string]string{"token": token, "provider": "github"})
 		message = "authorization:github:success:" + string(payload)
