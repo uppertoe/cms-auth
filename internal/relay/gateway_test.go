@@ -104,3 +104,101 @@ func TestOIDCModeIgnoresGatewayHeaders(t *testing.T) {
 		t.Errorf("status = %d, want the OIDC redirect (302)", rec.Code)
 	}
 }
+
+// gatewayOutcome runs one /auth request and reports whether a session was
+// issued, failing the test if the response is neither handshake.
+func gatewayOutcome(t *testing.T, cfg *config.Config, h map[string]string) bool {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	newServer(cfg).Handler().ServeHTTP(rec, gatewayRequest(h))
+	body := rec.Body.String()
+	switch {
+	case strings.Contains(body, "authorization:github:success:"):
+		return true
+	case strings.Contains(body, "authorization:github:error:"):
+		return false
+	}
+	t.Fatalf("no handshake; status=%d body=%s", rec.Code, body)
+	return false
+}
+
+func TestGatewayRemoteRolesIgnoredWhenNotTrusted(t *testing.T) {
+	// A forged Remote-Roles neither admits someone without the group...
+	h := validGatewayHeaders()
+	h[gatewayGroupsHeader] = "user"
+	h[gatewayRolesHeader] = "user"
+	if gatewayOutcome(t, gatewayConfig(t), h) {
+		t.Error("forged Remote-Roles admitted an editor with the setting off")
+	}
+	// ...nor refuses someone with it.
+	h = validGatewayHeaders()
+	h[gatewayRolesHeader] = "viewer"
+	if !gatewayOutcome(t, gatewayConfig(t), h) {
+		t.Error("Remote-Roles refused a group member with the setting off")
+	}
+}
+
+func TestGatewayTrustedRemoteRoles(t *testing.T) {
+	cases := []struct {
+		name   string
+		roles  *string // nil: header absent
+		groups string
+		want   bool
+	}{
+		{"user role, no group", ptr("user"), "", true},
+		{"user among roles", ptr("admin, user"), "", true},
+		{"roles lack user", ptr("admin"), "cms-editors", false},
+		{"empty roles", ptr(""), "cms-editors", false},
+		{"role prefix", ptr("users"), "cms-editors", false},
+		{"no header, group", nil, "cms-editors", true},
+		{"no header, no group", nil, "user", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := gatewayConfig(t)
+			cfg.TrustRemoteRoles = true
+			h := validGatewayHeaders()
+			h[gatewayGroupsHeader] = tc.groups
+			if tc.roles != nil {
+				h[gatewayRolesHeader] = *tc.roles
+			}
+			if got := gatewayOutcome(t, cfg, h); got != tc.want {
+				t.Errorf("admitted = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGatewayTrustedRemoteRolesWithoutEditorGroup(t *testing.T) {
+	cfg := gatewayConfig(t)
+	cfg.TrustRemoteRoles = true
+	cfg.EditorGroup = ""
+
+	h := validGatewayHeaders()
+	h[gatewayRolesHeader] = "user"
+	if !gatewayOutcome(t, cfg, h) {
+		t.Error("Remote-Roles user refused without EDITOR_GROUP")
+	}
+	// Without Remote-Roles there is no group to fall back to, so even an
+	// empty group list cannot match the empty EDITOR_GROUP.
+	for _, groups := range []string{"user, cms-editors", ""} {
+		h = validGatewayHeaders()
+		h[gatewayGroupsHeader] = groups
+		if gatewayOutcome(t, cfg, h) {
+			t.Errorf("fallback admitted groups %q without EDITOR_GROUP", groups)
+		}
+	}
+}
+
+func TestGatewaySecretCheckedBeforeRemoteRoles(t *testing.T) {
+	cfg := gatewayConfig(t)
+	cfg.TrustRemoteRoles = true
+	h := validGatewayHeaders()
+	h[gatewayRolesHeader] = "user"
+	delete(h, gatewaySecretHeader)
+	if gatewayOutcome(t, cfg, h) {
+		t.Error("Remote-Roles admitted a request without the gateway secret")
+	}
+}
+
+func ptr(s string) *string { return &s }
