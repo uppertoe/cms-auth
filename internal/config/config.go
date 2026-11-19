@@ -46,9 +46,12 @@ type Config struct {
 	// --- Gateway mode ---
 	// GatewaySecret is the value the proxy injects as X-Gateway-Secret; the
 	// identity headers are ignored without it. EditorGroup is the group the
-	// identity must carry (gateway mode requires it).
-	GatewaySecret string
-	EditorGroup   string
+	// identity must carry; gateway mode requires it unless TrustRemoteRoles
+	// is on, when it is only the fallback for a request without Remote-Roles.
+	// TrustRemoteRoles admits an editor whose Remote-Roles contains "user".
+	GatewaySecret    string
+	EditorGroup      string
+	TrustRemoteRoles bool
 
 	// --- OIDC (this broker is a confidential client of the provider) ---
 	OIDCIssuer       string // e.g. https://sso.example.org (discovery base)
@@ -98,6 +101,7 @@ func Load() (*Config, error) {
 		AuthMode:         envOr("AUTH_MODE", "oidc"),
 		GatewaySecret:    os.Getenv("GATEWAY_SECRET"),
 		EditorGroup:      os.Getenv("EDITOR_GROUP"),
+		TrustRemoteRoles: envBool("TRUST_REMOTE_ROLES", false),
 		OIDCIssuer:       strings.TrimRight(os.Getenv("OIDC_ISSUER"), "/"),
 		OIDCClientID:     os.Getenv("OIDC_CLIENT_ID"),
 		OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
@@ -127,7 +131,9 @@ func Load() (*Config, error) {
 		req("OIDC_CLIENT_SECRET", c.OIDCClientSecret)
 	case "gateway":
 		req("GATEWAY_SECRET", c.GatewaySecret)
-		req("EDITOR_GROUP", c.EditorGroup)
+		if !c.TrustRemoteRoles {
+			req("EDITOR_GROUP", c.EditorGroup)
+		}
 		if c.GatewaySecret != "" && len(c.GatewaySecret) < 32 {
 			return nil, fmt.Errorf("GATEWAY_SECRET must be at least 32 characters")
 		}

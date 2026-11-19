@@ -15,11 +15,21 @@ import (
 // reaches the broker any other way cannot assert an identity. The proxy must
 // gate /auth only: /api stays authenticated by the session token, because the
 // CMS calls it cross-origin without the gateway cookie.
+//
+// With TRUST_REMOTE_ROLES on, the gateway's role guard is the authority on
+// who edits: a Remote-Roles list containing "user" admits the editor, and a
+// Remote-Roles list without it is refused outright. Only when Remote-Roles is
+// absent does the broker fall back to EDITOR_GROUP in Remote-Groups. With the
+// setting off, Remote-Roles is ignored entirely.
 
 const (
 	gatewaySecretHeader = "X-Gateway-Secret"
 	gatewayEmailHeader  = "Remote-Email"
 	gatewayGroupsHeader = "Remote-Groups"
+	gatewayRolesHeader  = "Remote-Roles"
+
+	// editorRole is the app role the gateway grants to CMS editors.
+	editorRole = "user"
 )
 
 // A plain address only: break-glass sessions arrive as "breakglass:<id>".
@@ -55,13 +65,36 @@ func (s *Server) gatewayEditor(r *http.Request) (Editor, string) {
 	if !gatewayEmailPattern.MatchString(email) {
 		return Editor{}, "Remote-Email is not a plain address"
 	}
-	groups := strings.FieldsFunc(r.Header.Get(gatewayGroupsHeader), func(c rune) bool {
-		return c == ',' || c == ' ' || c == '\t'
-	})
-	if !containsStr(groups, s.cfg.EditorGroup) {
-		return Editor{}, "missing editor group"
+	if reason := s.gatewayEditorRight(r); reason != "" {
+		return Editor{}, reason
 	}
 	return Editor{Sub: email, Email: email, Name: nameFromEmail(email)}, ""
+}
+
+// gatewayEditorRight checks that the gateway says this person may edit, by
+// Remote-Roles when trusted and present, else by EDITOR_GROUP.
+func (s *Server) gatewayEditorRight(r *http.Request) string {
+	if s.cfg.TrustRemoteRoles {
+		if values := r.Header.Values(gatewayRolesHeader); len(values) > 0 {
+			if !containsStr(splitHeaderList(strings.Join(values, ",")), editorRole) {
+				return "Remote-Roles lacks " + editorRole
+			}
+			return ""
+		}
+	}
+	if s.cfg.EditorGroup == "" {
+		return "no Remote-Roles and no EDITOR_GROUP to fall back to"
+	}
+	if !containsStr(splitHeaderList(r.Header.Get(gatewayGroupsHeader)), s.cfg.EditorGroup) {
+		return "missing editor group"
+	}
+	return ""
+}
+
+func splitHeaderList(v string) []string {
+	return strings.FieldsFunc(v, func(c rune) bool {
+		return c == ',' || c == ' ' || c == '\t'
+	})
 }
 
 // nameFromEmail turns "jane.citizen@example.org" into "Jane Citizen" for the

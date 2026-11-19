@@ -69,6 +69,31 @@ func setGatewayEnv(t *testing.T) {
 	t.Setenv("AUTH_MODE", "gateway")
 	t.Setenv("GATEWAY_SECRET", "gateway-secret-gateway-secret-0123")
 	t.Setenv("EDITOR_GROUP", "cms-editors")
+	t.Setenv("TRUST_REMOTE_ROLES", "")
+}
+
+func TestLoad_TrustRemoteRolesOffByDefault(t *testing.T) {
+	setGatewayEnv(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.TrustRemoteRoles {
+		t.Error("TrustRemoteRoles is on without TRUST_REMOTE_ROLES")
+	}
+}
+
+func TestLoad_TrustRemoteRolesMakesEditorGroupOptional(t *testing.T) {
+	setGatewayEnv(t)
+	t.Setenv("TRUST_REMOTE_ROLES", "true")
+	t.Setenv("EDITOR_GROUP", "")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.TrustRemoteRoles || c.EditorGroup != "" {
+		t.Errorf("config = %+v", c)
+	}
 }
 
 func TestLoad_GatewayModeNeedsNoOIDC(t *testing.T) {

@@ -63,7 +63,8 @@ config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 | `ALLOWED_REPOS` | ✅ | | comma-separated `owner/name` the proxy may touch; the installation token is scoped to exactly these |
 | `AUTH_MODE` | | `oidc` | `oidc` runs the OIDC flow below; `gateway` trusts an authenticating reverse proxy (see "Gateway mode") |
 | `GATEWAY_SECRET` | gateway | | 32+ characters; the proxy injects it as `X-Gateway-Secret`, and the identity headers are ignored without it |
-| `EDITOR_GROUP` | gateway | | the group `Remote-Groups` must contain |
+| `EDITOR_GROUP` | gateway* | | the group `Remote-Groups` must contain (`*` optional when `TRUST_REMOTE_ROLES` is on) |
+| `TRUST_REMOTE_ROLES` | | `false` | admit the editor by the gateway's `Remote-Roles` (see "Gateway mode") |
 | `OIDC_ISSUER` | oidc | | issuer base, e.g. `https://sso.example.org` (endpoints via discovery) |
 | `OIDC_CLIENT_ID` | oidc | | OIDC client id registered with the provider |
 | `OIDC_CLIENT_SECRET` | oidc | | OIDC client secret (confidential client) |
@@ -100,6 +101,18 @@ Citizen"). The proxy must:
 
 Break-glass identities (`breakglass:…`) and anything that is not a plain
 email address are refused.
+
+The broker checks `X-Gateway-Secret` first, then the email, then the editor's
+role. With `TRUST_REMOTE_ROLES=true`, the gateway decides who edits. A
+`Remote-Roles` list that contains `user` admits the editor, and a
+`Remote-Roles` list without `user` is refused, with no fallback to groups.
+If `Remote-Roles` is absent, the broker falls back to `EDITOR_GROUP`, and if
+`EDITOR_GROUP` is unset as well, the request is refused. The proxy must
+strip any client-sent `Remote-Roles` before setting its own, as the
+gateway's `auth_gate_role "cms" "user"` guard does.
+
+With `TRUST_REMOTE_ROLES` off, which is the default, the broker ignores
+`Remote-Roles` and admits only members of `EDITOR_GROUP`.
 
 ## Wiring a CMS site to it
 
