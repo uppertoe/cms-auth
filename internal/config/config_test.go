@@ -96,6 +96,34 @@ func TestLoad_TrustRemoteRolesMakesEditorGroupOptional(t *testing.T) {
 	}
 }
 
+func TestLoad_EditorRole(t *testing.T) {
+	for _, tc := range []struct{ env, want string }{
+		{"", "user"},
+		{"editor", "editor"},
+		{" editor ", "editor"},
+	} {
+		setGatewayEnv(t)
+		t.Setenv("EDITOR_ROLE", tc.env)
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("EDITOR_ROLE=%q: Load: %v", tc.env, err)
+		}
+		if c.EditorRole != tc.want {
+			t.Errorf("EDITOR_ROLE=%q: EditorRole = %q, want %q", tc.env, c.EditorRole, tc.want)
+		}
+	}
+}
+
+func TestLoad_EditorRoleMustBeARoleName(t *testing.T) {
+	for _, v := range []string{"Editor", "editor,user", "editor user", "*"} {
+		setGatewayEnv(t)
+		t.Setenv("EDITOR_ROLE", v)
+		if _, err := Load(); err == nil {
+			t.Errorf("EDITOR_ROLE=%q was accepted", v)
+		}
+	}
+}
+
 func TestLoad_GatewayModeNeedsNoOIDC(t *testing.T) {
 	setGatewayEnv(t)
 	c, err := Load()

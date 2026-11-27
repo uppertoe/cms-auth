@@ -24,10 +24,14 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// roleNamePattern is the gateway's form of a role name.
+var roleNamePattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
 
 type Config struct {
 	ListenAddr string
@@ -48,10 +52,12 @@ type Config struct {
 	// identity headers are ignored without it. EditorGroup is the group the
 	// identity must carry; gateway mode requires it unless TrustRemoteRoles
 	// is on, when it is only the fallback for a request without Remote-Roles.
-	// TrustRemoteRoles admits an editor whose Remote-Roles contains "user".
+	// TrustRemoteRoles admits an editor whose Remote-Roles contains
+	// EditorRole, the name of the gateway's editing role for the CMS.
 	GatewaySecret    string
 	EditorGroup      string
 	TrustRemoteRoles bool
+	EditorRole       string
 
 	// --- OIDC (this broker is a confidential client of the provider) ---
 	OIDCIssuer       string // e.g. https://sso.example.org (discovery base)
@@ -102,6 +108,7 @@ func Load() (*Config, error) {
 		GatewaySecret:    os.Getenv("GATEWAY_SECRET"),
 		EditorGroup:      os.Getenv("EDITOR_GROUP"),
 		TrustRemoteRoles: envBool("TRUST_REMOTE_ROLES", false),
+		EditorRole:       strings.TrimSpace(envOr("EDITOR_ROLE", "user")),
 		OIDCIssuer:       strings.TrimRight(os.Getenv("OIDC_ISSUER"), "/"),
 		OIDCClientID:     os.Getenv("OIDC_CLIENT_ID"),
 		OIDCClientSecret: os.Getenv("OIDC_CLIENT_SECRET"),
@@ -136,6 +143,9 @@ func Load() (*Config, error) {
 		}
 		if c.GatewaySecret != "" && len(c.GatewaySecret) < 32 {
 			return nil, fmt.Errorf("GATEWAY_SECRET must be at least 32 characters")
+		}
+		if !roleNamePattern.MatchString(c.EditorRole) {
+			return nil, fmt.Errorf("EDITOR_ROLE must be a role name (lower-case letters, digits, - and _), not %q", c.EditorRole)
 		}
 	default:
 		return nil, fmt.Errorf("AUTH_MODE must be oidc or gateway, not %q", c.AuthMode)

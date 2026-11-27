@@ -17,8 +17,8 @@ import (
 // CMS calls it cross-origin without the gateway cookie.
 //
 // With TRUST_REMOTE_ROLES on, the gateway's role guard is the authority on
-// who edits: a Remote-Roles list containing "user" admits the editor, and a
-// Remote-Roles list without it is refused outright. Only when Remote-Roles is
+// who edits: a Remote-Roles list containing EDITOR_ROLE (by default "user")
+// admits the editor, and a Remote-Roles list without it is refused outright. Only when Remote-Roles is
 // absent does the broker fall back to EDITOR_GROUP in Remote-Groups. With the
 // setting off, Remote-Roles is ignored entirely.
 
@@ -27,9 +27,6 @@ const (
 	gatewayEmailHeader  = "Remote-Email"
 	gatewayGroupsHeader = "Remote-Groups"
 	gatewayRolesHeader  = "Remote-Roles"
-
-	// editorRole is the app role the gateway grants to CMS editors.
-	editorRole = "user"
 )
 
 // A plain address only: break-glass sessions arrive as "breakglass:<id>".
@@ -76,8 +73,8 @@ func (s *Server) gatewayEditor(r *http.Request) (Editor, string) {
 func (s *Server) gatewayEditorRight(r *http.Request) string {
 	if s.cfg.TrustRemoteRoles {
 		if values := r.Header.Values(gatewayRolesHeader); len(values) > 0 {
-			if !containsStr(splitHeaderList(strings.Join(values, ",")), editorRole) {
-				return "Remote-Roles lacks " + editorRole
+			if !containsStr(splitHeaderList(strings.Join(values, ",")), s.cfg.EditorRole) {
+				return "Remote-Roles lacks " + s.cfg.EditorRole
 			}
 			return ""
 		}
