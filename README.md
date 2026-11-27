@@ -65,6 +65,7 @@ config here and is added to `ALLOWED_ORIGINS` and `ALLOWED_REPOS`.
 | `GATEWAY_SECRET` | gateway | | 32+ characters; the proxy injects it as `X-Gateway-Secret`, and the identity headers are ignored without it |
 | `EDITOR_GROUP` | gateway* | | the group `Remote-Groups` must contain (`*` optional when `TRUST_REMOTE_ROLES` is on) |
 | `TRUST_REMOTE_ROLES` | | `false` | admit the editor by the gateway's `Remote-Roles` (see "Gateway mode") |
+| `EDITOR_ROLE` | | `user` | the role `Remote-Roles` must contain when `TRUST_REMOTE_ROLES` is on, matched exactly |
 | `OIDC_ISSUER` | oidc | | issuer base, e.g. `https://sso.example.org` (endpoints via discovery) |
 | `OIDC_CLIENT_ID` | oidc | | OIDC client id registered with the provider |
 | `OIDC_CLIENT_SECRET` | oidc | | OIDC client secret (confidential client) |
@@ -104,15 +105,24 @@ email address are refused.
 
 The broker checks `X-Gateway-Secret` first, then the email, then the editor's
 role. With `TRUST_REMOTE_ROLES=true`, the gateway decides who edits. A
-`Remote-Roles` list that contains `user` admits the editor, and a
-`Remote-Roles` list without `user` is refused, with no fallback to groups.
-If `Remote-Roles` is absent, the broker falls back to `EDITOR_GROUP`, and if
-`EDITOR_GROUP` is unset as well, the request is refused. The proxy must
-strip any client-sent `Remote-Roles` before setting its own, as the
-gateway's `auth_gate_role "cms" "user"` guard does.
+`Remote-Roles` list that contains `EDITOR_ROLE` admits the editor, and a
+`Remote-Roles` list without it is refused, with no fallback to groups. The
+match is exact: with `EDITOR_ROLE=editor`, a list holding `editors`,
+`cms-editor` or `Editor` is refused. `EDITOR_ROLE` defaults to `user` for
+the deployments that predate it, and the broker refuses to start if it is
+not a role name (lower-case letters, digits, `-` and `_`). If `Remote-Roles`
+is absent, the broker falls back to `EDITOR_GROUP`, and if `EDITOR_GROUP` is
+unset as well, the request is refused. The proxy must strip any client-sent
+`Remote-Roles` before setting its own, as the gateway's
+`auth_gate_role "cms" "editor"` guard does.
+
+The gateway sends only the roles a person holds in the app, so someone who
+holds only Editor arrives with `Remote-Roles: editor`, not `user`. Set
+`EDITOR_ROLE` to the role the guard on `/auth` requires, and give editors
+that role on the gateway before the broker starts requiring it.
 
 With `TRUST_REMOTE_ROLES` off, which is the default, the broker ignores
-`Remote-Roles` and admits only members of `EDITOR_GROUP`.
+`Remote-Roles` and `EDITOR_ROLE` and admits only members of `EDITOR_GROUP`.
 
 ## Wiring a CMS site to it
 

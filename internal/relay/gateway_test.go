@@ -17,6 +17,7 @@ func gatewayConfig(t *testing.T) *config.Config {
 	cfg.AuthMode = "gateway"
 	cfg.GatewaySecret = testGatewaySecret
 	cfg.EditorGroup = "cms-editors"
+	cfg.EditorRole = "user" // the default Load gives
 	return cfg
 }
 
@@ -166,6 +167,55 @@ func TestGatewayTrustedRemoteRoles(t *testing.T) {
 				t.Errorf("admitted = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestGatewayTrustedRemoteRolesEditorRole(t *testing.T) {
+	cases := []struct {
+		name  string
+		roles string
+		want  bool
+	}{
+		{"editor alone", "editor", true},
+		{"editor among roles", "admin,editor", true},
+		{"editor with spaces", "admin, editor", true},
+		{"lacks editor", "user,admin", false},
+		{"user alone", "user", false},
+		{"empty", "", false},
+		{"editor as a prefix", "editors", false},
+		{"editor as a suffix", "cms-editor", false},
+		{"part of editor", "edit", false},
+		{"editor in capitals", "Editor", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := gatewayConfig(t)
+			cfg.TrustRemoteRoles = true
+			cfg.EditorRole = "editor"
+			h := validGatewayHeaders()
+			h[gatewayRolesHeader] = tc.roles
+			if got := gatewayOutcome(t, cfg, h); got != tc.want {
+				t.Errorf("admitted = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGatewayEditorRoleIgnoredWhenNotTrusted(t *testing.T) {
+	// With TRUST_REMOTE_ROLES off, EDITOR_ROLE changes nothing: the group
+	// decides, whatever Remote-Roles says.
+	cfg := gatewayConfig(t)
+	cfg.EditorRole = "editor"
+	h := validGatewayHeaders()
+	h[gatewayRolesHeader] = "user"
+	if !gatewayOutcome(t, cfg, h) {
+		t.Error("a group member was refused with the setting off")
+	}
+	h = validGatewayHeaders()
+	h[gatewayGroupsHeader] = "user"
+	h[gatewayRolesHeader] = "editor"
+	if gatewayOutcome(t, cfg, h) {
+		t.Error("Remote-Roles editor admitted someone without the group with the setting off")
 	}
 }
 
